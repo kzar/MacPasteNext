@@ -60,6 +60,7 @@ struct Translator {
         "tip_mouse_btn": ["en": "Which mouse button toggles the microphone. Pick the one your mouse exposes (most thumb buttons report as 3 or 4).", "de": "Welche Maustaste das Mikrofon umschaltet. Waehle die, die deine Maus liefert (Daumentasten melden meist 3 oder 4)."],
         "tip_show_logs": ["en": "Show the live debug console alongside the settings panel. Useful for troubleshooting capture/paste timing or filing bug reports.", "de": "Zeigt die Live-Debug-Konsole neben dem Einstellungsbereich. Nuetzlich fuer Timing-Diagnose oder Fehlerberichte."],
         "tip_language": ["en": "Switch the app language. The menu bar and settings update immediately.", "de": "Wechselt die App-Sprache. Menueleiste und Einstellungen werden sofort aktualisiert."],
+        "updates_unavailable": ["en": "Updates are turned off in this build: it carries no Sparkle public key, so a downloaded update could not be verified. Official releases include the key.", "de": "Updates sind in diesem Build deaktiviert: er enthaelt keinen Sparkle-Public-Key, ein heruntergeladenes Update waere also nicht ueberpruefbar. Offizielle Releases enthalten den Key."],
         "updates_section": ["en": "Updates", "de": "Updates"],
         "update_feed_label": ["en": "Update feed", "de": "Update-Feed"],
         "acc_steps_title": ["en": "Next steps", "de": "Nächste Schritte"],
@@ -246,11 +247,28 @@ class MacPasteAppDelegate: NSObject, NSApplicationDelegate {
     // Sparkle auto-updater. The controller reads SUFeedURL and SUPublicEDKey
     // from Info.plist (populated by build-release.sh). Background checks are
     // started here; the menu item below also lets users trigger them manually.
-    lazy var updaterController: SPUStandardUpdaterController = SPUStandardUpdaterController(
-        startingUpdater: true,
-        updaterDelegate: nil,
-        userDriverDelegate: nil
-    )
+    //
+    // nil when the bundle carries no SUPublicEDKey. Sparkle refuses to start
+    // without one and reports that as an alert on launch, which is every
+    // locally built copy: the key only exists as a CI variable, so
+    // build-release.sh substitutes an empty string. Starting an updater that
+    // cannot verify anything has no upside, so don't.
+    lazy var updaterController: SPUStandardUpdaterController? = {
+        guard MacPasteAppDelegate.hasUpdateSigningKey else { return nil }
+        return SPUStandardUpdaterController(
+            startingUpdater: true,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
+    }()
+
+    /// Whether this bundle can verify an update, i.e. whether it was built with
+    /// a Sparkle public key. Read from Info.plist rather than the controller so
+    /// asking does not start the updater.
+    static var hasUpdateSigningKey: Bool {
+        let key = Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String
+        return !(key ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
     var isMicMuted: Bool = false
 
     var isAccessibilityGranted: Bool = false
@@ -300,6 +318,10 @@ class MacPasteAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applyAutoUpdatePreference() {
+        guard let updaterController = updaterController else {
+            logStore.add("Sparkle disabled: this build has no update signing key")
+            return
+        }
         // Touching .updater also starts the controller if needed.
         let desired = settings.autoUpdateEnabled
         if updaterController.updater.automaticallyChecksForUpdates != desired {
@@ -460,13 +482,20 @@ class MacPasteAppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        let checkUpdatesItem = NSMenuItem(
-            title: Translator.get("menu_check_updates", lang: l),
-            action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)),
-            keyEquivalent: ""
-        )
-        checkUpdatesItem.target = updaterController
-        menu.addItem(checkUpdatesItem)
+        // Omitted entirely when there is no updater to target, rather than
+        // offered as a menu item that can only fail. Stays nil in that case, so
+        // the language refresh below simply has nothing to retitle.
+        var checkUpdatesItem: NSMenuItem?
+        if let updaterController = updaterController {
+            let item = NSMenuItem(
+                title: Translator.get("menu_check_updates", lang: l),
+                action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)),
+                keyEquivalent: ""
+            )
+            item.target = updaterController
+            menu.addItem(item)
+            checkUpdatesItem = item
+        }
 
         let aboutItem = NSMenuItem(title: Translator.get("menu_about", lang: l), action: #selector(showAbout), keyEquivalent: "")
         menu.addItem(aboutItem)
@@ -1036,15 +1065,23 @@ struct ContentView: View {
                         Divider()
                         Text(Translator.get("updates_section", lang: settings.language)).font(.headline)
 
-                        Toggle(Translator.get("auto_update_label", lang: settings.language), isOn: $settings.autoUpdateEnabled)
-                            .help(Translator.get("auto_update_help", lang: settings.language))
-                            .onChange(of: settings.autoUpdateEnabled) { _ in
-                                appDelegate.applyAutoUpdatePreference()
+                        if MacPasteAppDelegate.hasUpdateSigningKey {
+                            Toggle(Translator.get("auto_update_label", lang: settings.language), isOn: $settings.autoUpdateEnabled)
+                                .help(Translator.get("auto_update_help", lang: settings.language))
+                                .onChange(of: settings.autoUpdateEnabled) { _ in
+                                    appDelegate.applyAutoUpdatePreference()
+                                }
+                            Button(Translator.get("menu_check_updates", lang: settings.language)) {
+                                appDelegate.updaterController?.checkForUpdates(nil)
                             }
-                        Button(Translator.get("menu_check_updates", lang: settings.language)) {
-                            appDelegate.updaterController.checkForUpdates(nil)
+                            .buttonStyle(.bordered)
+                        } else {
+                            // Say why rather than showing controls that cannot work.
+                            Text(Translator.get("updates_unavailable", lang: settings.language))
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                        .buttonStyle(.bordered)
 
                         Divider()
                         Text("UI & Logs").font(.headline)
