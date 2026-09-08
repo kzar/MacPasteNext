@@ -114,6 +114,57 @@ class EventHandler {
         return CGRect(origin: origin, size: size)
     }
 
+    // How far above the clicked element to look for a control. Browsers hand
+    // back the AXStaticText inside a link, a tab or the URL bar - all three
+    // report exactly that role - and put the interactive role on an ancestor,
+    // so the ancestry is the only thing that tells them apart. Very little
+    // depth is needed: the interactive role has been the immediate parent in
+    // every case seen so far.
+    private static let controlAncestorDepth = 4
+
+    // Controls the app has its own use for the middle button on, so the click
+    // should reach it rather than paste over it: a link opens in a new tab, a
+    // browser tab closes. Firefox exposes each of its tabs as an
+    // AXRadioButton. Deliberately not AXTabGroup: matching the group as well
+    // would add nothing - the button is always found first - while suppressing
+    // paste anywhere inside a tabbed app's content.
+    private static let appHandledMiddleClickRoles: Set<String> = [
+        "AXLink",
+        "AXRadioButton",
+    ]
+
+    /// The control at or above `point` that the app should handle the
+    /// middle-click on, plus the roles walked to find it. The chain is
+    /// returned either way so a control we do not yet recognise can be
+    /// identified from the debug console rather than guessed at.
+    ///
+    /// Deliberately shallow - a hit test plus a few parent lookups, not the
+    /// full descent caretTarget performs - because this runs inside the tap
+    /// callback. An app exposing no accessibility tree answers nothing, so this
+    /// only ever adds behaviour.
+    private func appHandledControl(at point: CGPoint) -> (matched: String?, chain: [String]) {
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, Self.axTimeoutSeconds)
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &hit) == .success,
+              let hit = hit
+        else { return (nil, []) }
+
+        var chain: [String] = []
+        var current = hit
+        for _ in 0..<Self.controlAncestorDepth {
+            let r = role(of: current)
+            chain.append(r)
+            if Self.appHandledMiddleClickRoles.contains(r) { return (r, chain) }
+            var raw: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(current, kAXParentAttribute as CFString, &raw) == .success,
+                  let raw = raw, CFGetTypeID(raw) == AXUIElementGetTypeID()
+            else { return (nil, chain) }
+            current = raw as! AXUIElement
+        }
+        return (nil, chain)
+    }
+
     /// The app owning the topmost ordinary window containing `point`, and
     /// whether that window is already the frontmost one of its app.
     ///
@@ -343,6 +394,23 @@ class EventHandler {
                         }
                     }
                     return Unmanaged.passUnretained(event)
+                }
+
+                // A middle-click the app has its own meaning for - opening a
+                // link in a new tab, closing a browser tab - is a better use of
+                // the button than a paste the user never aimed at a text field.
+                let control = appHandledControl(at: clickLocation)
+                if let matched = control.matched {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.logStore.add("Action: middle-click on \(matched) passed through to the app")
+                    }
+                    return Unmanaged.passUnretained(event)
+                }
+                if !control.chain.isEmpty {
+                    let chain = control.chain.joined(separator: " < ")
+                    DispatchQueue.main.async { [weak self] in
+                        self?.logStore.add("Action: middle-click over [\(chain)], no app-handled control, pasting")
+                    }
                 }
 
                 swallowedDownButtons.insert(buttonNumber)
