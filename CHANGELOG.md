@@ -6,6 +6,18 @@ The format is inspired by Keep a Changelog and semantic versioning style release
 
 ## [Unreleased]
 
+- Changed
+
+- The PRIMARY selection now lives in the system-wide `Selection` named pasteboard instead of a buffer inside MacPasteNext. `Selection` is the name GNU Emacs's Cocoa port uses for its own PRIMARY emulation, so MacPasteNext and Emacs now share one selection: with `select-enable-primary` set, `C-y` in Emacs yanks text you highlighted anywhere on the system, and an Emacs region (mouse or keyboard) pastes on middle-click in any app.
+- MacPasteNext now keeps out of the way of apps that maintain PRIMARY themselves, currently GNU Emacs. Selections made in Emacs are no longer captured, because Emacs publishes its own region via `select-active-regions` and our synthesized `Cmd+C` is `kill-ring-save` there - which deactivated the region you had just made and added a kill-ring entry. Middle-clicks in Emacs are no longer intercepted either, because Emacs binds `mouse-2` to `mouse-yank-primary`, which inserts PRIMARY at the click position - more precisely than MacPasteNext can, since Emacs exposes no accessibility tree for its buffer. MacPasteNext still brings the clicked Emacs window to the front, since a middle-click does not activate a window on macOS.
+- PRIMARY survives a MacPasteNext restart, because the macOS pasteboard server holds it rather than the app.
+- Any process in your login session can now read *or set* PRIMARY - the same trust model as the regular `Cmd+C` clipboard. Middle-click therefore pastes whatever holds the selection now, not necessarily MacPasteNext's last capture.
+- Middle-click paste no longer requires MacPasteNext to have captured something first, so it also works with *Auto-Copy on Selection* turned off.
+
+- Known limitations
+
+- Middle-click paste into Emacs inserts at point rather than at the click position, because MacPasteNext swallows the middle-click before Emacs's own `mouse-yank-primary` can see it.
+
 ## [v1.0.1] - 2026-06-05
 
 - Fixed

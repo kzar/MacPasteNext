@@ -55,8 +55,9 @@ The app embeds [Sparkle](https://sparkle-project.org/) and checks the signed `ap
 
 ## Features
 
-- 🖱 **Auto-Copy on Selection**: Highlight text in *any* app, and it is instantly captured into an internal Linux-style PRIMARY buffer. Your regular `Cmd+C` clipboard is preserved.
-- 🖱 **Middle-Click Paste**: Click your middle mouse button to paste your PRIMARY buffer instantly.
+- 🖱 **Auto-Copy on Selection**: Highlight text in *any* app, and it is instantly published as the system-wide Linux-style PRIMARY selection. Your regular `Cmd+C` clipboard is preserved.
+- 🖱 **Middle-Click Paste**: Click your middle mouse button to paste the PRIMARY selection instantly.
+- 🐧 **GNU Emacs Interop**: PRIMARY is stored in the `Selection` pasteboard that Emacs's Cocoa port already uses, so the two share one selection. With `select-enable-primary` set, `C-y` in Emacs yanks what you highlighted elsewhere, and an Emacs region pastes on middle-click anywhere.
 - 🎤 **Global Microphone Mute**: Toggle your system microphone on/off using a side mouse button. It remembers your previous volume level and displays a distinct Red/Green indicator in the macOS Menu Bar.
 - ♻️ **Auto-Updates**: Powered by [Sparkle](https://sparkle-project.org/). The app checks for new releases in the background and offers one-click updates. EdDSA signatures verify every download.
 - 🌍 **Localization**: Fluent in both English and German.

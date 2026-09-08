@@ -20,17 +20,136 @@ class EventHandler {
 
     // Each captureSelectionToPrimary call bumps this; pending captures check it
     // to bail out if a newer click (e.g. triple-click after double-click)
-    // wants to overwrite the buffer.
+    // wants to overwrite the selection.
     private var captureGeneration: Int = 0
 
-    // Linux-style PRIMARY selection buffer. Lives only in this process and
-    // is NOT the system clipboard (Cmd+C content is preserved across captures).
-    private var primaryBuffer: String = ""
+    // The PRIMARY selection itself is not stored here: see PrimaryPasteboard,
+    // which keeps it in the system-wide "Selection" pasteboard. It is still
+    // NOT the system clipboard — Cmd+C content is snapshotted and restored
+    // around every capture and paste.
 
     // Tracks which mouse-down events we swallowed so we can also swallow the
     // matching mouse-up. Without this, the OS would see an "up without down"
     // for the intercepted side button and might still react to it.
     private var swallowedDownButtons: Set<Int64> = []
+
+    // Apps that maintain the PRIMARY selection themselves, so we should keep
+    // out of their way in both directions. GNU Emacs publishes its region via
+    // select-active-regions and binds mouse-2 to mouse-yank-primary, which
+    // inserts PRIMARY at the click position - both better than anything we can
+    // synthesize, and both broken by us intervening. See selfManagesPrimary.
+    private static let selfManagedPrimaryBundleIDs: Set<String> = [
+        "org.gnu.Emacs" // Cocoa/NS port, including emacs-plus and emacs-mac
+    ]
+
+    // The frontmost app's bundle ID, kept current by an activation observer.
+    // Cached because the swallow decision has to be made inside the event tap
+    // callback, which must stay cheap: NSWorkspace there would put an AppKit
+    // round trip in the hot path.
+    private var frontmostBundleID: String?
+    private var activationObserver: NSObjectProtocol?
+
+    /// Whether the frontmost app looks after PRIMARY itself. The right question
+    /// for capture, since a selection lives in whichever app has focus.
+    private var frontmostSelfManagesPrimary: Bool {
+        guard let id = frontmostBundleID else { return false }
+        return Self.selfManagedPrimaryBundleIDs.contains(id)
+    }
+
+    // AX calls block the caller, and an unresponsive target would otherwise
+    // stall us for the default timeout. A quarter second is plenty for a
+    // healthy app.
+    private static let axTimeoutSeconds: Float = 0.25
+
+    /// Raises the clicked window within its app, then brings the app forward.
+    /// Both halves matter: activating an app raises whichever window was last
+    /// frontmost, which for a multi-window app is often not the one clicked.
+    @discardableResult
+    func focus(pid: pid_t, windowContaining point: CGPoint) -> Bool {
+        let axApp = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(axApp, Self.axTimeoutSeconds)
+
+        var rawWindows: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &rawWindows) == .success,
+           let windows = rawWindows as? [AXUIElement] {
+            for window in windows where axFrame(of: window)?.contains(point) == true {
+                AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+                AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+                break
+            }
+        }
+
+        // kAXFrontmost is the Accessibility route to the front and works from a
+        // background agent like us, which is why it is tried first; we already
+        // hold the permission for the event tap.
+        if AXUIElementSetAttributeValue(axApp, kAXFrontmostAttribute as CFString, kCFBooleanTrue) == .success {
+            return true
+        }
+        guard let app = NSRunningApplication(processIdentifier: pid) else { return false }
+        if #available(macOS 14.0, *) {
+            return app.activate()
+        }
+        return app.activate(options: [])
+    }
+
+    /// An AX window's frame in global top-left-origin coordinates, or nil if
+    /// the app does not report a usable position and size.
+    func axFrame(of window: AXUIElement) -> CGRect? {
+        // Concrete types rather than a generic helper: AXValueGetValue writes
+        // through a raw pointer, so the destination must be a plain struct.
+        func axValue(_ attribute: String) -> AXValue? {
+            var raw: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(window, attribute as CFString, &raw) == .success,
+                  let raw = raw, CFGetTypeID(raw) == AXValueGetTypeID()
+            else { return nil }
+            return (raw as! AXValue)
+        }
+        var origin = CGPoint.zero
+        var size = CGSize.zero
+        guard let rawOrigin = axValue(kAXPositionAttribute),
+              AXValueGetValue(rawOrigin, .cgPoint, &origin),
+              let rawSize = axValue(kAXSizeAttribute),
+              AXValueGetValue(rawSize, .cgSize, &size)
+        else { return nil }
+        return CGRect(origin: origin, size: size)
+    }
+
+    /// The app owning the topmost ordinary window containing `point`, and
+    /// whether that window is already the frontmost one of its app.
+    ///
+    /// Coordinates are global and top-left origin, matching CGEvent.location
+    /// and kCGWindowBounds, so they compare directly. Only the owner name is
+    /// read, never kCGWindowName, so this needs no Screen Recording
+    /// permission.
+    func windowOwner(
+        under point: CGPoint
+    ) -> (pid: pid_t, bundleID: String?, name: String, isFrontWindowOfApp: Bool)? {
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+            return nil
+        }
+        let ownPid = ProcessInfo.processInfo.processIdentifier
+        // The list runs front to back, so the first window containing the point
+        // is the one the user clicked, and any earlier window with the same pid
+        // means the clicked one is not that app's frontmost.
+        var pidsSeenInFront = Set<pid_t>()
+        for window in windows {
+            guard let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue, layer == 0,
+                  let pid = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value, pid != ownPid,
+                  let bounds = window[kCGWindowBounds as String] as? NSDictionary,
+                  let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary)
+            else { continue }
+            if frame.contains(point) {
+                let app = NSRunningApplication(processIdentifier: pid)
+                let name = window[kCGWindowOwnerName as String] as? String
+                    ?? app?.localizedName
+                    ?? "pid \(pid)"
+                return (pid, app?.bundleIdentifier, name, !pidsSeenInFront.contains(pid))
+            }
+            pidsSeenInFront.insert(pid)
+        }
+        return nil
+    }
 
     init(settings: SettingsStore, logStore: LogStore) {
         self.settings = settings
@@ -43,6 +162,16 @@ class EventHandler {
             return
         }
         logStore.add("Starting CGEventTap...")
+
+        frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            self?.frontmostBundleID = app?.bundleIdentifier
+        }
 
         let eventMask: CGEventMask =
             (1 << CGEventType.leftMouseDown.rawValue) |
@@ -84,6 +213,11 @@ class EventHandler {
             }
             CFMachPortInvalidate(tap)
         }
+        if let activationObserver = activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
+        }
+        activationObserver = nil
+        frontmostBundleID = nil
         eventTap = nil
         runLoopSource = nil
         swallowedDownButtons.removeAll()
@@ -171,6 +305,39 @@ class EventHandler {
             // paste pref enabled, X11-aware apps, etc.) do not paste a second
             // time on top of our Cmd+V (issue #1).
             if settings.middleClickPaste && buttonNumber == 2 && Int(buttonNumber) != settings.micMuteButton {
+                // Emacs binds mouse-2 to mouse-yank-primary, which sets point
+                // at the click position and inserts PRIMARY there. Since
+                // PRIMARY is now the shared "Selection" pasteboard, letting
+                // the click through gives exactly the behaviour we are trying
+                // to imitate - and more precisely than we can, because Emacs
+                // exposes no accessibility tree for its buffer, so our
+                // synthesized caret click has nothing to aim at and the paste
+                // would land at the existing point instead.
+                // Keyed on the window under the pointer, not the frontmost app,
+                // so this also works when the Emacs window clicked is not the
+                // frontmost one. That costs a CGWindowListCopyWindowInfo call
+                // inside the tap callback, which the callback otherwise avoids
+                // - acceptable only because it runs on middle-clicks alone, a
+                // deliberate and infrequent gesture, rather than on every
+                // mouse event.
+                let clickLocation = event.location
+                if let target = windowOwner(under: clickLocation),
+                   let bundleID = target.bundleID,
+                   Self.selfManagedPrimaryBundleIDs.contains(bundleID) {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self else { return }
+                        self.logStore.add("Action: middle-click passed through to \(target.name), which pastes PRIMARY itself")
+                        // A middle-click does not activate a window on macOS,
+                        // so the target would paste while staying behind.
+                        // Focus it ourselves, as a left-click would have.
+                        if !(target.isFrontWindowOfApp
+                             && NSRunningApplication(processIdentifier: target.pid)?.isActive == true) {
+                            self.focus(pid: target.pid, windowContaining: clickLocation)
+                        }
+                    }
+                    return Unmanaged.passUnretained(event)
+                }
+
                 swallowedDownButtons.insert(buttonNumber)
                 DispatchQueue.main.async { [weak self] in
                     self?.logStore.add("Action: middle-click intercepted -> paste from PRIMARY")
@@ -237,6 +404,21 @@ class EventHandler {
     // MARK: - PRIMARY selection (Linux-style)
 
     func captureSelectionToPrimary() {
+        // Emacs publishes its own region to PRIMARY via select-active-regions,
+        // so our Cmd+C is redundant there - and harmful: it runs
+        // ns-copy-including-secondary, i.e. kill-ring-save, which deactivates
+        // the region the user just made and adds a kill-ring entry.
+        //
+        // This has to stay ahead of the generation bump below. Bumping
+        // invalidates any in-flight capture, and that capture then skips its
+        // own restorePasteboard() on the assumption that the newer one will
+        // restore instead - so returning after a bump would leave the general
+        // clipboard holding whatever the previous Cmd+C copied.
+        if frontmostSelfManagesPrimary {
+            logStore.add("PRIMARY: \(frontmostBundleID ?? "?") publishes its own selection, capture skipped")
+            return
+        }
+
         captureGeneration += 1
         let myGen = captureGeneration
         // Give the host app a few frames to finalize the selection.
@@ -281,10 +463,15 @@ class EventHandler {
             let captured = pb.string(forType: .string)
             let postCopyChangeCount = pb.changeCount
             if let s = captured, !s.isEmpty {
-                primaryBuffer = s
-                logStore.add("PRIMARY buffer updated (\(s.count) chars): \(Self.previewForLog(s))")
+                // Publish before restoring below, so PRIMARY is correct even
+                // if the restore guard decides to bail out.
+                if PrimaryPasteboard.write(s) {
+                    logStore.add("PRIMARY updated (\(s.count) chars): \(Self.previewForLog(s))")
+                } else {
+                    logStore.add("PRIMARY: write to the \"\(PrimaryPasteboard.name.rawValue)\" pasteboard failed")
+                }
             } else {
-                logStore.add("PRIMARY: clipboard changed but no string payload; buffer kept")
+                logStore.add("PRIMARY: clipboard changed but no string payload; selection kept")
             }
             // If something else wrote to the pasteboard between us reading
             // and us restoring, don't clobber that newer content with our
@@ -314,8 +501,16 @@ class EventHandler {
     }
 
     func pasteFromPrimary() {
-        guard !primaryBuffer.isEmpty else {
-            logStore.add("PRIMARY paste skipped: buffer empty")
+        // Read live rather than from a cache: another app (e.g. Emacs) may own
+        // the selection. nil means nothing has claimed the pasteboard this
+        // login session, its owner disowned it, or it holds no text payload.
+        guard let text = PrimaryPasteboard.read() else {
+            logStore.add("PRIMARY paste skipped: no selection available")
+            return
+        }
+        // Distinct from nil: any app can publish an empty string.
+        guard !text.isEmpty else {
+            logStore.add("PRIMARY paste skipped: selection empty")
             return
         }
 
@@ -323,8 +518,8 @@ class EventHandler {
         let snapshot = snapshotPasteboard()
 
         pb.clearContents()
-        pb.setString(primaryBuffer, forType: .string)
-        // Snapshot the change count AFTER we wrote our primaryBuffer. If
+        pb.setString(text, forType: .string)
+        // Snapshot the change count AFTER we wrote the PRIMARY text. If
         // anyone (user via Cmd+C, another app) writes to the pasteboard
         // between now and the restore below, we must not overwrite their
         // newer content with our pre-paste snapshot.

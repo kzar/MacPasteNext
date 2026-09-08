@@ -15,6 +15,10 @@ The app processes input events and clipboard interactions locally on your Mac to
 
 It does not intentionally transmit personal data to external servers.
 
+The PRIMARY selection is stored in a system-wide named pasteboard called `Selection` (the name GNU Emacs's Cocoa port uses), not inside the app. Like the regular clipboard, its contents can be read and overwritten by any process in your login session, and it persists until something replaces it - including after MacPasteNext quits.
+
+The in-app debug console logs a truncated 30-character preview of each captured selection, and *Help -> Export Debug Logs* writes those previews to a file you choose. Since PRIMARY is shared, a preview may show text that was selected in another application. Nothing is written anywhere else, and the console is cleared when the app quits.
+
 ## Permissions
 
 macOS permissions are required for core behavior:
