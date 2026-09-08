@@ -339,9 +339,12 @@ class EventHandler {
                 }
 
                 swallowedDownButtons.insert(buttonNumber)
+                // pasteFromPrimary needs the click location to focus the
+                // window we clicked, since swallowing the event above denied
+                // it the chance.
                 DispatchQueue.main.async { [weak self] in
                     self?.logStore.add("Action: middle-click intercepted -> paste from PRIMARY")
-                    self?.pasteFromPrimary()
+                    self?.pasteFromPrimary(at: clickLocation)
                 }
                 return nil
             }
@@ -500,7 +503,10 @@ class EventHandler {
         }
     }
 
-    func pasteFromPrimary() {
+    /// Pastes the PRIMARY selection. `clickLocation` is the middle-click point
+    /// in global display coordinates; pass nil to paste into whatever already
+    /// has keyboard focus.
+    func pasteFromPrimary(at clickLocation: CGPoint? = nil) {
         // Read live rather than from a cache: another app (e.g. Emacs) may own
         // the selection. nil means nothing has claimed the pasteboard this
         // login session, its owner disowned it, or it holds no text payload.
@@ -514,6 +520,13 @@ class EventHandler {
             return
         }
 
+        // Our Cmd+V lands wherever keyboard focus already is, but we swallowed
+        // the middle-click, so an unfocused target never got the click that
+        // would have focused it - the paste went to the previously focused app
+        // instead, or nowhere visible. Linux focuses the window under the
+        // pointer and pastes there, so do the focusing ourselves.
+        let activationDelayMs = clickLocation.map { focusTarget(at: $0) } ?? 0
+
         let pb = NSPasteboard.general
         let snapshot = snapshotPasteboard()
 
@@ -525,11 +538,12 @@ class EventHandler {
         // newer content with our pre-paste snapshot.
         let postSetChangeCount = pb.changeCount
 
-        simulatePaste()
+        simulatePaste(extraDelayMs: activationDelayMs)
 
-        // simulatePaste posts Cmd+V after pasteDelayMs. Give the receiving app
-        // a small extra window to consume the paste before we restore.
-        let restoreDelayMs = Int(settings.pasteDelayMs) + 250
+        // simulatePaste posts Cmd+V after pasteDelayMs (plus any settle time we
+        // asked for above). Give the receiving app a small extra window to
+        // consume the paste before we restore.
+        let restoreDelayMs = Int(settings.pasteDelayMs) + activationDelayMs + 250
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(restoreDelayMs)) { [weak self] in
             guard let self = self else { return }
             let currentChangeCount = NSPasteboard.general.changeCount
@@ -597,6 +611,43 @@ class EventHandler {
         }
     }
 
+    // MARK: - Focusing the paste target
+
+    // How long to let a newly activated app settle before we post Cmd+V.
+    // Activation is asynchronous, and a paste that arrives first goes to the
+    // outgoing app instead.
+    private static let activationSettleMs = 150
+
+    /// Brings the window under `point` to the front so our Cmd+V reaches it.
+    /// Returns the extra delay (ms) the caller should add before pasting: 0
+    /// when no activation was needed or possible.
+    private func focusTarget(at point: CGPoint) -> Int {
+        guard let target = windowOwner(under: point) else {
+            logStore.add("PRIMARY: no window under the pointer, pasting into the focused app")
+            return 0
+        }
+        let wasActive = NSRunningApplication(processIdentifier: target.pid)?.isActive == true
+
+        // Fast path for the common case - clicking into the window you are
+        // already typing in. Nothing to focus, and no AX round trips.
+        if wasActive && target.isFrontWindowOfApp {
+            return 0
+        }
+
+        guard focus(pid: target.pid, windowContaining: point) else {
+            logStore.add("PRIMARY: could not focus \(target.name), pasting into the focused app")
+            return 0
+        }
+        if wasActive {
+            // Same app, different window: it only had to be raised, and no app
+            // switch has to settle before we paste.
+            logStore.add("PRIMARY: raised the \(target.name) window under the pointer")
+            return 0
+        }
+        logStore.add("PRIMARY: focused \(target.name) under the pointer before pasting")
+        return Self.activationSettleMs
+    }
+
     // MARK: - Keyboard simulation
 
     func simulateCopy() {
@@ -612,10 +663,11 @@ class EventHandler {
         logStore.add("System: Sent Cmd+C")
     }
 
-    func simulatePaste(at location: CGPoint? = nil) {
+    func simulatePaste(extraDelayMs: Int = 0) {
         let source = CGEventSource(stateID: .combinedSessionState)
+        let delayMs = Int(settings.pasteDelayMs) + extraDelayMs
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(settings.pasteDelayMs))) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) {
             let pasteKeyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true) // 'V'
             let pasteKeyUp = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false)
 

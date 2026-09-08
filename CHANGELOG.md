@@ -14,9 +14,13 @@ The format is inspired by Keep a Changelog and semantic versioning style release
 - Any process in your login session can now read *or set* PRIMARY - the same trust model as the regular `Cmd+C` clipboard. Middle-click therefore pastes whatever holds the selection now, not necessarily MacPasteNext's last capture.
 - Middle-click paste no longer requires MacPasteNext to have captured something first, so it also works with *Auto-Copy on Selection* turned off.
 
+- Fixed
+
+- Middle-clicking a window that did not already have keyboard focus did nothing useful - the paste went to whichever app was focused, or nowhere visible. MacPasteNext must swallow the middle-click so apps with their own middle-click paste cannot paste twice, but that also denied the clicked window the click that would have focused it. MacPasteNext now brings the window under the pointer to the front itself (raising the specific window, not just its app) and then pastes, matching the Linux behaviour. Clicking into the window you are already typing in is unchanged.
+
 - Known limitations
 
-- Middle-click paste into Emacs inserts at point rather than at the click position, because MacPasteNext swallows the middle-click before Emacs's own `mouse-yank-primary` can see it.
+- Middle-click pastes at the target's existing text cursor, not at the point you clicked. MacPasteNext focuses the window but does not move the caret, so this differs from Linux toolkits.
 
 ## [v1.0.1] - 2026-06-05
 

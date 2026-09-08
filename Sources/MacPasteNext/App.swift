@@ -1065,7 +1065,7 @@ struct ContentView: View {
                                     appDelegate.eventHandler?.simulateCopy()
                                 }
                                 Button(Translator.get("sim_paste", lang: settings.language)) {
-                                    appDelegate.eventHandler?.simulatePaste(at: NSEvent.mouseLocation)
+                                    appDelegate.eventHandler?.simulatePaste()
                                 }
                             }
                         }
