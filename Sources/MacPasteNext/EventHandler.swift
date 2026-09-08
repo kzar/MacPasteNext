@@ -249,6 +249,13 @@ class EventHandler {
             return Unmanaged.passUnretained(event)
         }
 
+        // Pass the caret clicks we synthesize ourselves straight through
+        // without touching selection state, so they can never be mistaken for
+        // a user selection. See clickToPlaceCaret.
+        if event.getIntegerValueField(.eventSourceUserData) == Self.syntheticClickUserData {
+            return Unmanaged.passUnretained(event)
+        }
+
         switch type {
         case .leftMouseDown:
             // Track the click state here: it is reliably set on mouse-down
@@ -436,6 +443,7 @@ class EventHandler {
                 self.logStore.add("PRIMARY: capture #\(myGen) superseded by #\(self.captureGeneration), skipping")
                 return
             }
+
             let pb = NSPasteboard.general
             let snapshot = self.snapshotPasteboard()
             let initialChangeCount = pb.changeCount
@@ -527,6 +535,26 @@ class EventHandler {
         // pointer and pastes there, so do the focusing ourselves.
         let activationDelayMs = clickLocation.map { focusTarget(at: $0) } ?? 0
 
+        // Linux also drops the caret where you clicked, so do that too - but
+        // only over an editable text field. A left-click is not inert: a few
+        // pixels off and it presses a button, follows a link or hits Send.
+        var caretPoint: CGPoint?
+        if settings.pasteAtPointer, let point = clickLocation {
+            let target = caretTarget(at: point)
+            switch target.decision {
+            case .textCaret:
+                caretPoint = point
+            case .container:
+                // The app stopped exposing its tree here, so we cannot confirm
+                // a text field - but without the click there may be no focused
+                // field for Cmd+V to reach at all, which is the worse outcome.
+                caretPoint = point
+                logStore.add("PRIMARY: \(target.description) exposes no caret; clicking the container to focus it")
+            case .refused:
+                logStore.add("PRIMARY: \(target.description) under the pointer is not clickable, pasting at the existing caret")
+            }
+        }
+
         let pb = NSPasteboard.general
         let snapshot = snapshotPasteboard()
 
@@ -537,6 +565,18 @@ class EventHandler {
         // between now and the restore below, we must not overwrite their
         // newer content with our pre-paste snapshot.
         let postSetChangeCount = pb.changeCount
+
+        if let caretPoint = caretPoint {
+            // Deliberately after any app switch has settled, so the click is
+            // not consumed as the window-activating first click. simulatePaste
+            // adds pasteDelayMs on top, which is the gap the target gets to
+            // process the click before Cmd+V arrives.
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(activationDelayMs)) { [weak self] in
+                guard let self = self else { return }
+                self.clickToPlaceCaret(at: caretPoint)
+                self.logStore.add("PRIMARY: caret placed at the pointer before pasting")
+            }
+        }
 
         simulatePaste(extraDelayMs: activationDelayMs)
 
@@ -646,6 +686,151 @@ class EventHandler {
         }
         logStore.add("PRIMARY: focused \(target.name) under the pointer before pasting")
         return Self.activationSettleMs
+    }
+
+    // MARK: - Placing the caret at the pointer
+
+    // Fallback for apps that report a text role but do not answer the
+    // kAXSelectedTextRange query used as the primary test below.
+    private static let caretClickRoles: Set<String> = [kAXTextFieldRole, kAXTextAreaRole]
+
+    // Content containers we will click into when the app exposes nothing finer
+    // at the click point. Their children failing to appear is a
+    // tree-completeness problem, not evidence that a control is there -
+    // Electron and other web-view apps routinely stop at one of these, and
+    // then a paste has no focused field to land in at all.
+    //
+    // AXWindow is deliberately NOT here. It is what an app reports when it
+    // exposes no tree whatsoever (Firefox), and it covers the titlebar,
+    // toolbar and tab strip as well as content, so clicking it blind would
+    // press whatever happens to be under the pointer.
+    private static let caretClickContainerRoles: Set<String> = [
+        kAXScrollAreaRole,  // Electron apps, including the Claude desktop app
+        kAXGroupRole,
+        "AXWebArea",        // WebKit/Chromium content; no kAX constant exists
+    ]
+
+    /// What we decided about the element under the pointer.
+    private enum CaretClickDecision {
+        /// Exposes a text caret, so a click moves an insertion point.
+        case textCaret
+        /// A content container the app exposed nothing below. Clicking is a
+        /// judgement call rather than a certainty.
+        case container
+        /// Nothing we are willing to click.
+        case refused
+    }
+
+    // Tags the clicks we synthesize so our own tap can tell them from the
+    // user's. A caret click cannot trigger a capture today (click state 1, no
+    // drag), but if that condition ever loosened the click would fire Cmd+C
+    // and feed itself, so the guard is worth having now.
+    private static let syntheticClickUserData: Int64 = 0x4D50_4E58 // "MPNX"
+
+    // Bounds on the manual hit test below. AX calls are synchronous, so the
+    // walk has to be cheap enough to sit in front of a paste: at most this
+    // many levels deep and this many element queries in total.
+    private static let axMaxDescentDepth = 12
+    private static let axHitTestBudget = 250
+
+    /// Whether the element the user clicked is a text element we can safely
+    /// click into, plus the trail of roles we walked - the caller logs that
+    /// when we refuse, which is what makes an app's own limits diagnosable.
+    ///
+    /// The test is kAXSelectedTextRange rather than a role allowlist: anything
+    /// exposing a caret and a selection range is a text element, and buttons,
+    /// links, checkboxes and menu items are not. That generalises across apps
+    /// far better than enumerating roles, which browsers in particular make a
+    /// losing game.
+    private func caretTarget(at point: CGPoint) -> (description: String, decision: CaretClickDecision) {
+        let system = AXUIElementCreateSystemWide()
+        // Set on the system-wide element, which applies to every AX message
+        // this process sends, including the ones to elements found below.
+        AXUIElementSetMessagingTimeout(system, Self.axTimeoutSeconds)
+
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &hit) == .success,
+              let hit = hit
+        else { return ("nothing", .refused) }
+
+        // Firefox (and anything else that does not hit-test into its own
+        // content) answers with the top-level AXWindow, so descend ourselves.
+        var trail = [role(of: hit)]
+        var element = hit
+        var budget = Self.axHitTestBudget
+        var depth = 0
+        while depth < Self.axMaxDescentDepth, budget > 0, !hasTextCaret(element) {
+            guard let child = frontmostChild(of: element, containing: point, budget: &budget) else { break }
+            element = child
+            trail.append(role(of: child))
+            depth += 1
+        }
+
+        let description = trail.joined(separator: " > ")
+        if hasTextCaret(element) { return (description, .textCaret) }
+        if Self.caretClickContainerRoles.contains(role(of: element)) {
+            return (description, .container)
+        }
+        return (description, .refused)
+    }
+
+    /// The first child of `element` whose frame contains `point`. Children
+    /// that do not report a frame are skipped rather than descended into:
+    /// guessing past them is what would let us click an unrelated control.
+    private func frontmostChild(
+        of element: AXUIElement,
+        containing point: CGPoint,
+        budget: inout Int
+    ) -> AXUIElement? {
+        var rawChildren: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &rawChildren) == .success,
+              let children = rawChildren as? [AXUIElement]
+        else { return nil }
+        for child in children {
+            if budget <= 0 { return nil }
+            budget -= 1
+            if axFrame(of: child)?.contains(point) == true { return child }
+        }
+        return nil
+    }
+
+    /// True when `element` exposes a text caret, so clicking it moves an
+    /// insertion point rather than activating a control.
+    private func hasTextCaret(_ element: AXUIElement) -> Bool {
+        var rawRange: CFTypeRef?
+        if AXUIElementCopyAttributeValue(
+            element, kAXSelectedTextRangeAttribute as CFString, &rawRange
+        ) == .success {
+            return true
+        }
+        return Self.caretClickRoles.contains(role(of: element))
+    }
+
+    private func role(of element: AXUIElement) -> String {
+        var rawRole: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &rawRole) == .success,
+              let role = rawRole as? String
+        else { return "unreadable" }
+        return role
+    }
+
+    /// Clicks at `point` to move the target's text cursor there before we
+    /// paste. Only call this once the target window is already active: a click
+    /// on an inactive window is usually consumed as the activating click
+    /// (`acceptsFirstMouse` defaults to false), so the caret would not move.
+    private func clickToPlaceCaret(at point: CGPoint) {
+        let source = CGEventSource(stateID: .combinedSessionState)
+        for mouseType in [CGEventType.leftMouseDown, .leftMouseUp] {
+            guard let click = CGEvent(
+                mouseEventSource: source,
+                mouseType: mouseType,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            ) else { continue }
+            click.setIntegerValueField(.mouseEventClickState, value: 1)
+            click.setIntegerValueField(.eventSourceUserData, value: Self.syntheticClickUserData)
+            click.post(tap: .cgSessionEventTap)
+        }
     }
 
     // MARK: - Keyboard simulation

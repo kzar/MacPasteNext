@@ -17,10 +17,11 @@ The format is inspired by Keep a Changelog and semantic versioning style release
 - Fixed
 
 - Middle-clicking a window that did not already have keyboard focus did nothing useful - the paste went to whichever app was focused, or nowhere visible. MacPasteNext must swallow the middle-click so apps with their own middle-click paste cannot paste twice, but that also denied the clicked window the click that would have focused it. MacPasteNext now brings the window under the pointer to the front itself (raising the specific window, not just its app) and then pastes, matching the Linux behaviour. Clicking into the window you are already typing in is unchanged.
+- Middle-click now moves the text cursor to where you clicked before pasting, matching middle-click paste on Linux, controlled by a new *Paste at pointer position* toggle (on by default, under *Middle click paste*). A click is synthesized when the element under the pointer exposes a text caret, and also when it is a content container (`AXScrollArea`, `AXGroup`, `AXWebArea`) that the app exposed nothing below - web-view apps commonly stop there, and without the click a paste has no focused field to land in at all. Controls are never clicked, and neither is a bare `AXWindow`, which is what an app reports when it exposes no accessibility tree and would mean clicking blind into its titlebar and toolbar as well as its content. Anywhere else the paste lands at the cursor position the target already had, and the debug console names what it saw.
 
 - Known limitations
 
-- Middle-click pastes at the target's existing text cursor, not at the point you clicked. MacPasteNext focuses the window but does not move the caret, so this differs from Linux toolkits.
+- Paste at pointer position needs the target app to expose its Accessibility tree. Firefox does not - it answers a hit test with its top-level window and exposes nothing below it, because browsers only build that tree once they detect an assistive technology - so pasting into Firefox lands at its existing cursor.
 
 ## [v1.0.1] - 2026-06-05
 

@@ -19,6 +19,7 @@ struct Translator {
         "features": ["en": "Features", "de": "Features"],
         "auto_copy": ["en": "Auto-copy on selection", "de": "Auto-copy bei Auswahl"],
         "mid_paste": ["en": "Middle click paste", "de": "Mittelklick Paste"],
+        "paste_at_pointer": ["en": "Paste at pointer position", "de": "An Zeigerposition einfuegen"],
         "mic_mute": ["en": "Microphone Mute via Mouse", "de": "Mikrofon Stumm via Maustaste"],
         "mouse_btn": ["en": "Mouse Button", "de": "Maustaste"],
         "btn_2": ["en": "Button 2 (Middle)", "de": "Taste 2 (Mitte)"],
@@ -54,6 +55,7 @@ struct Translator {
         "auto_update_help": ["en": "Sparkle polls the release feed in the background and offers updates when a newer signed build is available.", "de": "Sparkle prueft den Release-Feed im Hintergrund und bietet ein Update an, sobald eine neuere signierte Version verfuegbar ist."],
         "tip_auto_copy": ["en": "When you select text with the mouse (drag, double-click, triple-click), publish it as the system-wide PRIMARY selection. The system clipboard (Cmd+C) is left untouched.", "de": "Wenn du Text mit der Maus auswaehlst (Ziehen, Doppelklick, Dreifachklick), wird die Auswahl als systemweite PRIMARY-Auswahl veroeffentlicht. Die System-Zwischenablage (Cmd+C) bleibt unveraendert."],
         "tip_mid_paste": ["en": "Middle-click pastes the PRIMARY selection wherever your cursor is, including a selection published by another app such as GNU Emacs. The native middle-click of the underlying app is swallowed so nothing pastes twice.", "de": "Mittelklick fuegt die PRIMARY-Auswahl an der Cursorposition ein, auch wenn sie aus einer anderen App wie GNU Emacs stammt. Der native Mittelklick der darunterliegenden App wird unterdrueckt, damit nichts doppelt eingefuegt wird."],
+        "tip_paste_at_pointer": ["en": "Before pasting, move the text cursor to where you middle-clicked, the way middle-click paste behaves on Linux. Done when the pointer is over a text field, or over a content area where the app reports nothing more specific - some apps expose no text field to aim at, and without the click a paste has nowhere to land. Buttons, links and other controls are never clicked. Turn this off to paste at the cursor position the target already had.", "de": "Setzt vor dem Einfuegen die Schreibmarke dorthin, wo du mittelgeklickt hast - so wie Mittelklick-Paste unter Linux funktioniert. Passiert, wenn der Zeiger ueber einem Textfeld steht oder ueber einem Inhaltsbereich, zu dem die App nichts Genaueres meldet - manche Apps legen kein Textfeld offen, und ohne den Klick hat ein Paste kein Ziel. Buttons, Links und andere Steuerelemente werden nie geklickt. Ausschalten, um an der bereits vorhandenen Schreibmarke einzufuegen."],
         "tip_mic_mute": ["en": "Toggle the system microphone with the selected mouse button. The intercepted press never reaches the OS or other apps.", "de": "Stummschaltung des System-Mikrofons via der gewaehlten Maustaste. Der abgefangene Klick erreicht weder macOS noch andere Apps."],
         "tip_mouse_btn": ["en": "Which mouse button toggles the microphone. Pick the one your mouse exposes (most thumb buttons report as 3 or 4).", "de": "Welche Maustaste das Mikrofon umschaltet. Waehle die, die deine Maus liefert (Daumentasten melden meist 3 oder 4)."],
         "tip_show_logs": ["en": "Show the live debug console alongside the settings panel. Useful for troubleshooting capture/paste timing or filing bug reports.", "de": "Zeigt die Live-Debug-Konsole neben dem Einstellungsbereich. Nuetzlich fuer Timing-Diagnose oder Fehlerberichte."],
@@ -1013,6 +1015,11 @@ struct ContentView: View {
                             .help(Translator.get("tip_auto_copy", lang: settings.language))
                         Toggle(Translator.get("mid_paste", lang: settings.language), isOn: $settings.middleClickPaste)
                             .help(Translator.get("tip_mid_paste", lang: settings.language))
+                        if settings.middleClickPaste {
+                            Toggle(Translator.get("paste_at_pointer", lang: settings.language), isOn: $settings.pasteAtPointer)
+                                .help(Translator.get("tip_paste_at_pointer", lang: settings.language))
+                                .padding(.leading, 20)
+                        }
                         
                         Toggle(Translator.get("mic_mute", lang: settings.language), isOn: $settings.enableMicMute)
                             .help(Translator.get("tip_mic_mute", lang: settings.language))

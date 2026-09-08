@@ -13,6 +13,10 @@ class SettingsStore: ObservableObject {
 
     @AppStorage("autoCopyOnSelect") var autoCopyOnSelect: Bool = true
     @AppStorage("middleClickPaste") var middleClickPaste: Bool = true
+    // Place the caret where you middle-clicked before pasting, the way
+    // middle-click paste behaves on Linux. Only ever done over an editable
+    // text field; see EventHandler.caretClickRoles.
+    @AppStorage("pasteAtPointer") var pasteAtPointer: Bool = true
     @AppStorage("pasteDelayMs") var pasteDelayMs: Double = 100.0 // delay in ms
     @AppStorage("isEnabled") var isEnabled: Bool = true
     
