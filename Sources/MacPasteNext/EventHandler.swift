@@ -8,8 +8,11 @@ class EventHandler {
 
     private let settings: SettingsStore
     private let logStore: LogStore
+    private let captureDiagnostics = CaptureDiagnostics()
+    private var captureTraceID = 0
 
     private var isDragging = false
+    private var mouseDownPoint: CGPoint?
     private var lastAutoCopyTriggerTime: TimeInterval = 0
     private let autoCopyDebounceSeconds: TimeInterval = 0.3
 
@@ -41,20 +44,6 @@ class EventHandler {
     private static let selfManagedPrimaryBundleIDs: Set<String> = [
         "org.gnu.Emacs" // Cocoa/NS port, including emacs-plus and emacs-mac
     ]
-
-    // The frontmost app's bundle ID, kept current by an activation observer.
-    // Cached because the swallow decision has to be made inside the event tap
-    // callback, which must stay cheap: NSWorkspace there would put an AppKit
-    // round trip in the hot path.
-    private var frontmostBundleID: String?
-    private var activationObserver: NSObjectProtocol?
-
-    /// Whether the frontmost app looks after PRIMARY itself. The right question
-    /// for capture, since a selection lives in whichever app has focus.
-    private var frontmostSelfManagesPrimary: Bool {
-        guard let id = frontmostBundleID else { return false }
-        return Self.selfManagedPrimaryBundleIDs.contains(id)
-    }
 
     // AX calls block the caller, and an unresponsive target would otherwise
     // stall us for the default timeout. A quarter second is plenty for a
@@ -214,16 +203,6 @@ class EventHandler {
         }
         logStore.add("Starting CGEventTap...")
 
-        frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] note in
-            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            self?.frontmostBundleID = app?.bundleIdentifier
-        }
-
         let eventMask: CGEventMask =
             (1 << CGEventType.leftMouseDown.rawValue) |
             (1 << CGEventType.leftMouseUp.rawValue) |
@@ -264,15 +243,11 @@ class EventHandler {
             }
             CFMachPortInvalidate(tap)
         }
-        if let activationObserver = activationObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
-        }
-        activationObserver = nil
-        frontmostBundleID = nil
         eventTap = nil
         runLoopSource = nil
         swallowedDownButtons.removeAll()
         isDragging = false
+        mouseDownPoint = nil
         lastClickState = 1
         logStore.add("CGEventTap removed.")
     }
@@ -312,6 +287,7 @@ class EventHandler {
             // Track the click state here: it is reliably set on mouse-down
             // across apps (the matching up event sometimes loses it).
             lastClickState = event.getIntegerValueField(.mouseEventClickState)
+            mouseDownPoint = event.location
             isDragging = false
             return Unmanaged.passUnretained(event)
 
@@ -323,7 +299,12 @@ class EventHandler {
             let isMultiClick = lastClickState >= 2
             let wasDragging = isDragging
             let triggerCopy = wasDragging || isMultiClick
+            let gesture = CaptureGesture(
+                start: mouseDownPoint, end: event.location,
+                clickCount: lastClickState, dragged: wasDragging
+            )
             isDragging = false
+            mouseDownPoint = nil
 
             if settings.autoCopyOnSelect && triggerCopy {
                 let now = Date().timeIntervalSince1970
@@ -332,14 +313,20 @@ class EventHandler {
                 // triple-click can overwrite a pending double-click capture.
                 if !withinDebounce || isMultiClick {
                     lastAutoCopyTriggerTime = now
-                    let clickStateForLog = lastClickState
                     // Defer real work so the tap callback returns immediately
                     // and macOS does not disable the tap for "running too long".
                     DispatchQueue.main.async { [weak self] in
                         guard let self = self else { return }
-                        self.logStore.add("Action: selection detected (clickState=\(clickStateForLog), drag=\(wasDragging)), capturing to PRIMARY")
-                        self.captureSelectionToPrimary()
+                        self.captureSelectionToPrimary(gesture: gesture)
                     }
+                } else if settings.showLogs {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.logStore.add("PRIMARY: \(gesture.description); skipped: drag debounce")
+                    }
+                }
+            } else if settings.showLogs && triggerCopy {
+                DispatchQueue.main.async { [weak self] in
+                    self?.logStore.add("PRIMARY: \(gesture.description); skipped: auto-copy disabled")
                 }
             }
             return Unmanaged.passUnretained(event)
@@ -464,10 +451,11 @@ class EventHandler {
         return PasteboardSnapshot(items: collected)
     }
 
-    private func restorePasteboard(_ snapshot: PasteboardSnapshot) {
+    @discardableResult
+    private func restorePasteboard(_ snapshot: PasteboardSnapshot) -> Bool {
         let pb = NSPasteboard.general
         pb.clearContents()
-        guard !snapshot.items.isEmpty else { return }
+        guard !snapshot.items.isEmpty else { return true }
         var rebuilt: [NSPasteboardItem] = []
         for bag in snapshot.items {
             let item = NSPasteboardItem()
@@ -476,12 +464,23 @@ class EventHandler {
             }
             rebuilt.append(item)
         }
-        pb.writeObjects(rebuilt)
+        return pb.writeObjects(rebuilt)
     }
 
     // MARK: - PRIMARY selection (Linux-style)
 
-    func captureSelectionToPrimary() {
+    func captureSelectionToPrimary(gesture: CaptureGesture? = nil) {
+        captureTraceID += 1
+        let trace = CaptureTrace(id: captureTraceID)
+        let sourceApp = NSWorkspace.shared.frontmostApplication
+        logStore.add(trace.message("\(gesture?.description ?? "capture requested without mouse coordinates"); source=\(CaptureDiagnostics.application(sourceApp)); enabled=\(settings.isEnabled), autoCopy=\(settings.autoCopyOnSelect), diagnostics=\(settings.showLogs)"))
+        guard settings.isEnabled, settings.autoCopyOnSelect,
+              let sourceApp = sourceApp
+        else {
+            logStore.add(trace.message("skipped: disabled or no frontmost app"))
+            return
+        }
+
         // Emacs publishes its own region to PRIMARY via select-active-regions,
         // so our Cmd+C is redundant there - and harmful: it runs
         // ns-copy-including-secondary, i.e. kill-ring-save, which deactivates
@@ -492,11 +491,19 @@ class EventHandler {
         // own restorePasteboard() on the assumption that the newer one will
         // restore instead - so returning after a bump would leave the general
         // clipboard holding whatever the previous Cmd+C copied.
-        if frontmostSelfManagesPrimary {
-            logStore.add("PRIMARY: \(frontmostBundleID ?? "?") publishes its own selection, capture skipped")
-            return
+        if let bundleID = sourceApp.bundleIdentifier {
+            if Self.selfManagedPrimaryBundleIDs.contains(bundleID) {
+                logStore.add(trace.message("skipped: \(bundleID) publishes its own selection"))
+                return
+            }
         }
 
+        let sourcePID = sourceApp.processIdentifier
+        if settings.showLogs {
+            captureDiagnostics.record(pid: sourcePID, gesture: gesture) { [weak self] message in
+                self?.logStore.add(trace.message(message))
+            }
+        }
         captureGeneration += 1
         let myGen = captureGeneration
         // Give the host app a few frames to finalize the selection.
@@ -508,15 +515,37 @@ class EventHandler {
             // A newer capture (e.g. triple-click after this double-click)
             // already supersedes us; let it do the work.
             if myGen != self.captureGeneration {
-                self.logStore.add("PRIMARY: capture #\(myGen) superseded by #\(self.captureGeneration), skipping")
+                self.logStore.add(trace.message("skipped: generation \(myGen) superseded by \(self.captureGeneration)"))
+                return
+            }
+
+            // Opening a document can switch apps during this delay. Cancel
+            // before touching either pasteboard if the source has lost focus.
+            let currentApp = NSWorkspace.shared.frontmostApplication
+            guard self.settings.isEnabled, self.settings.autoCopyOnSelect,
+                  currentApp?.processIdentifier == sourcePID
+            else {
+                self.logStore.add(trace.message("skipped before copy: frontmost=\(CaptureDiagnostics.application(currentApp)), enabled=\(self.settings.isEnabled), autoCopy=\(self.settings.autoCopyOnSelect)"))
                 return
             }
 
             let pb = NSPasteboard.general
+            self.logStore.add(trace.message("before clipboard snapshot: \(CaptureDiagnostics.clipboard(pb))"))
             let snapshot = self.snapshotPasteboard()
             let initialChangeCount = pb.changeCount
-            self.simulateCopy()
+            // Snapshotting can wait for another app to provide clipboard
+            // data. Recheck focus afterwards, and address Cmd+C to the source
+            // process so a subsequent app switch cannot deliver it elsewhere.
+            let appAfterSnapshot = NSWorkspace.shared.frontmostApplication
+            guard appAfterSnapshot?.processIdentifier == sourcePID else {
+                self.logStore.add(trace.message("skipped after clipboard snapshot: frontmost=\(CaptureDiagnostics.application(appAfterSnapshot))"))
+                return
+            }
+            self.simulateCopy(to: sourcePID)
+            self.logStore.add(trace.message("Cmd+C posted to pid=\(sourcePID); savedItems=\(snapshot.items.count), changeCount=\(initialChangeCount), timeout=300ms"))
             self.pollClipboardForCapture(
+                trace: trace,
+                sourcePID: sourcePID,
                 generation: myGen,
                 initialChangeCount: initialChangeCount,
                 snapshot: snapshot,
@@ -525,10 +554,11 @@ class EventHandler {
         }
     }
 
-    private func pollClipboardForCapture(generation: Int, initialChangeCount: Int, snapshot: PasteboardSnapshot, elapsedMs: Int) {
+    private func pollClipboardForCapture(trace: CaptureTrace, sourcePID: pid_t, generation: Int, initialChangeCount: Int, snapshot: PasteboardSnapshot, elapsedMs: Int) {
         // A newer capture took over; the newer poll will perform its own
         // restore, so just stop polling here.
         if generation != captureGeneration {
+            logStore.add(trace.message("poll stopped: generation \(generation) superseded by \(captureGeneration); restore deferred to newer capture"))
             return
         }
         let pb = NSPasteboard.general
@@ -541,36 +571,42 @@ class EventHandler {
             // pasteboard between our capture and our restore.
             let captured = pb.string(forType: .string)
             let postCopyChangeCount = pb.changeCount
+            let frontmost = NSWorkspace.shared.frontmostApplication
+            logStore.add(trace.message("clipboard changed after \(elapsedMs)ms polling: \(initialChangeCount) -> \(postCopyChangeCount); \(CaptureDiagnostics.clipboard(pb)); frontmost=\(CaptureDiagnostics.application(frontmost)), sourceStillFrontmost=\(frontmost?.processIdentifier == sourcePID)"))
             if let s = captured, !s.isEmpty {
                 // Publish before restoring below, so PRIMARY is correct even
                 // if the restore guard decides to bail out.
                 if PrimaryPasteboard.write(s) {
-                    logStore.add("PRIMARY updated (\(s.count) chars): \(Self.previewForLog(s))")
+                    logStore.add(trace.message("selection updated (\(s.count) chars): \(Self.previewForLog(s))"))
                 } else {
-                    logStore.add("PRIMARY: write to the \"\(PrimaryPasteboard.name.rawValue)\" pasteboard failed")
+                    logStore.add(trace.message("write to the \"\(PrimaryPasteboard.name.rawValue)\" pasteboard failed"))
                 }
             } else {
-                logStore.add("PRIMARY: clipboard changed but no string payload; selection kept")
+                logStore.add(trace.message("clipboard changed but plain text is \(captured == nil ? "unavailable" : "empty"); selection kept"))
             }
             // If something else wrote to the pasteboard between us reading
             // and us restoring, don't clobber that newer content with our
             // pre-capture snapshot.
             if pb.changeCount == postCopyChangeCount {
-                restorePasteboard(snapshot)
+                let restored = restorePasteboard(snapshot)
+                logStore.add(trace.message("clipboard restore \(restored ? "succeeded" : "failed"): \(CaptureDiagnostics.clipboard(pb))"))
             } else {
-                logStore.add("PRIMARY: clipboard changed externally during capture, restore skipped")
+                logStore.add(trace.message("clipboard changed again during capture: expected=\(postCopyChangeCount), actual=\(pb.changeCount); restore skipped"))
             }
             return
         }
 
         if elapsedMs >= timeoutMs {
-            logStore.add("PRIMARY: capture timed out, restoring clipboard")
-            restorePasteboard(snapshot)
+            logStore.add(trace.message("capture timed out after \(elapsedMs)ms polling; \(CaptureDiagnostics.clipboard(pb)); frontmost=\(CaptureDiagnostics.application(NSWorkspace.shared.frontmostApplication)); restoring clipboard"))
+            let restored = restorePasteboard(snapshot)
+            logStore.add(trace.message("clipboard restore \(restored ? "succeeded" : "failed"): \(CaptureDiagnostics.clipboard(pb))"))
             return
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(stepMs)) { [weak self] in
             self?.pollClipboardForCapture(
+                trace: trace,
+                sourcePID: sourcePID,
                 generation: generation,
                 initialChangeCount: initialChangeCount,
                 snapshot: snapshot,
@@ -903,7 +939,7 @@ class EventHandler {
 
     // MARK: - Keyboard simulation
 
-    func simulateCopy() {
+    func simulateCopy(to pid: pid_t? = nil) {
         let source = CGEventSource(stateID: .combinedSessionState)
         let copyKeyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true) // 'C'
         let copyKeyUp = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: false)
@@ -911,8 +947,13 @@ class EventHandler {
         copyKeyDown?.flags = .maskCommand
         copyKeyUp?.flags = .maskCommand
 
-        copyKeyDown?.post(tap: .cgSessionEventTap)
-        copyKeyUp?.post(tap: .cgSessionEventTap)
+        if let pid = pid {
+            copyKeyDown?.postToPid(pid)
+            copyKeyUp?.postToPid(pid)
+        } else {
+            copyKeyDown?.post(tap: .cgSessionEventTap)
+            copyKeyUp?.post(tap: .cgSessionEventTap)
+        }
         logStore.add("System: Sent Cmd+C")
     }
 

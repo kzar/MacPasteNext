@@ -653,6 +653,9 @@ class MacPasteAppDelegate: NSObject, NSApplicationDelegate {
         let header = [
             "MacPasteNext Debug Logs",
             "Version: \(short) (\(build))",
+            "macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)",
+            "Accessibility trusted: \(AXIsProcessTrusted())",
+            "Settings: enabled=\(settings.isEnabled), autoCopy=\(settings.autoCopyOnSelect), middleClickPaste=\(settings.middleClickPaste), pasteAtPointer=\(settings.pasteAtPointer), pasteDelayMs=\(settings.pasteDelayMs), diagnostics=\(settings.showLogs)",
             "Generated: \(ISO8601DateFormatter().string(from: Date()))",
             ""
         ].joined(separator: "\n")

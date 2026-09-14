@@ -216,6 +216,10 @@ Full app build/sign/smoke requires macOS because it depends on Apple tooling (`s
 
 ## Troubleshooting
 
+For unexpected copying, application alerts, or missed selections, enable **Show Debug Logs**, clear the console, reproduce the problem, then use **Help → Export Debug Logs…**. The console retains the newest 200 entries, so export soon after reproducing it. Include which app/control you clicked and whether you dragged, double-clicked or triple-clicked.
+
+Each automatic capture has a `capture #N` identifier and elapsed times connecting the gesture, source app, copy request, clipboard changes and final outcome. With the console enabled, an asynchronous accessibility snapshot also records roles/subroles at both gesture endpoints, their parent roles, and the focused element. Selection results distinguish present/empty text, unsupported attributes, missing values and AX errors. A probe can report that its time budget was exhausted or that another probe was already running; neither means there was no text selection. Snapshots may observe UI changes after the gesture and do not change copying decisions. The new probes log structure and selection lengths, not text contents; existing successful-capture entries still include a short text preview. Exports include macOS, Accessibility permission status and relevant settings.
+
 - **"App is damaged and can't be opened"** — Gatekeeper still sees the download as quarantined. Run `xattr -dr com.apple.quarantine /Applications/MacPasteNext.app` once and try again. The installer one-liner in [Install](#install-apple-silicon-macos-13) does this for you.
 - **Accessibility permission stuck / not prompting** — open the app, switch to *Settings* and use the *"Request Permission Again (tccutil reset)"* button. macOS occasionally caches a stale `denied` decision; the button clears it via `tccutil reset Accessibility io.github.joemild.macpastenext`.
 - **Middle-click is doing the wrong thing** — toggle *Middle-Click Paste* in the settings; if you map the mic-mute feature to button 2 it will take precedence over the paste action.
