@@ -45,6 +45,13 @@ class EventHandler {
         "org.gnu.Emacs" // Cocoa/NS port, including emacs-plus and emacs-mac
     ]
 
+    // QuickTime's Cmd+C copies a movie frame, which can raise an error while
+    // opening or playing video. Suppress all automatic captures there, even
+    // when its accessibility tree is incomplete or changes during a click.
+    private static let autoCopyExcludedBundleIDs: Set<String> = [
+        "com.apple.QuickTimePlayerX"
+    ]
+
     // AX calls block the caller, and an unresponsive target would otherwise
     // stall us for the default timeout. A quarter second is plenty for a
     // healthy app.
@@ -496,9 +503,22 @@ class EventHandler {
                 logStore.add(trace.message("skipped: \(bundleID) publishes its own selection"))
                 return
             }
+            if Self.autoCopyExcludedBundleIDs.contains(bundleID) {
+                logStore.add(trace.message("skipped: automatic copy disabled for \(bundleID)"))
+                return
+            }
         }
 
         let sourcePID = sourceApp.processIdentifier
+        // Check before the generation bump: a rejected click must not cancel
+        // an earlier copy's pending clipboard restoration. This runs outside
+        // the event tap and independently of the Show Debug Logs setting.
+        let control = autoCopyControl(pid: sourcePID, gesture: gesture)
+        logStore.add(trace.message("control guard: \(control.detail)"))
+        if control.blocksCopy {
+            logStore.add(trace.message("skipped: gesture on a menu/button control"))
+            return
+        }
         if settings.showLogs {
             captureDiagnostics.record(pid: sourcePID, gesture: gesture) { [weak self] message in
                 self?.logStore.add(trace.message(message))
@@ -552,6 +572,10 @@ class EventHandler {
                 elapsedMs: 0
             )
         }
+    }
+
+    func autoCopyControl(pid: pid_t, gesture: CaptureGesture?) -> AutoCopyControlGuard.Result {
+        AutoCopyControlGuard.check(pid: pid, gesture: gesture)
     }
 
     private func pollClipboardForCapture(trace: CaptureTrace, sourcePID: pid_t, generation: Int, initialChangeCount: Int, snapshot: PasteboardSnapshot, elapsedMs: Int) {
